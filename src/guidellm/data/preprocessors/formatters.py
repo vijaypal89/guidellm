@@ -78,7 +78,6 @@ class GenerativeTextCompletionsRequestFormatter(RequestFormatter):
             arguments.body["stream"] = True
             arguments.body["stream_options"] = {
                 "include_usage": True,
-                "continuous_usage_stats": True,
             }
 
         # Handle output tokens
@@ -88,7 +87,6 @@ class GenerativeTextCompletionsRequestFormatter(RequestFormatter):
             output_metrics.text_tokens = output_tokens
             arguments.body["max_tokens"] = output_tokens
             arguments.body["stop"] = None
-            arguments.body["ignore_eos"] = True
         elif self.max_tokens is not None:
             arguments.body["max_tokens"] = self.max_tokens
 
@@ -168,7 +166,6 @@ class GenerativeChatCompletionsRequestFormatter(RequestFormatter):
             arguments.body["stream"] = True
             arguments.body["stream_options"] = {
                 "include_usage": True,
-                "continuous_usage_stats": True,
             }
 
         # Handle output tokens
@@ -180,7 +177,6 @@ class GenerativeChatCompletionsRequestFormatter(RequestFormatter):
                 {
                     "max_completion_tokens": output_tokens,
                     "stop": None,
-                    "ignore_eos": True,
                 }
             )
         elif self.max_completion_tokens is not None:
