@@ -48,6 +48,14 @@ class TorchDataLoaderArgs(DataLoaderArgs):
             "will be performed in the main process."
         ),
     )
+    cycle: bool = Field(
+        default=False,
+        description=(
+            "Restart the datasets when they run out instead of ending the run. "
+            "Required for duration-based benchmarks, which would otherwise stop "
+            "early once the data is exhausted rather than at the time limit."
+        ),
+    )
 
 
 DataT = TypeVar("DataT")
@@ -60,8 +68,10 @@ class DatasetsIterator(TorchIterableDataset[DataT]):
         data_samples: int,
         preprocessors: list[DatasetPreprocessor | DataDependentPreprocessor],
         finalizer: DatasetFinalizer[DataT],
+        cycle: bool = False,
     ):
         self.datasets = datasets
+        self.cycle = cycle
         self.preprocessors = preprocessors
         for preprocessor in self.preprocessors:
             if isinstance(preprocessor, DataDependentPreprocessor):
@@ -110,11 +120,21 @@ class DatasetsIterator(TorchIterableDataset[DataT]):
                         dataset.set_epoch(epoch)
                 dataset_iters.append(iter(dataset))
 
+            def next_row(index: int) -> dict[str, Any]:
+                try:
+                    return {"dataset": next(dataset_iters[index])}
+                except StopIteration:
+                    if not self.cycle:
+                        raise
+                    # An empty dataset raises again here, ending iteration
+                    # instead of looping forever.
+                    dataset_iters[index] = iter(self.datasets[index])
+                    return {"dataset": next(dataset_iters[index])}
+
             while max_items is None or gen_count < max_items:
                 try:
                     row: list[dict[str, Any]] = [
-                        {"dataset": next(dataset_iter)}
-                        for dataset_iter in dataset_iters
+                        next_row(index) for index in range(len(dataset_iters))
                     ]
                     gen_count += 1
 
@@ -177,6 +197,7 @@ class TorchDataLoader(PyTorchDataLoader[DataT], InfoMixin, DataLoader[DataT]):
             data_samples=config.samples,
             preprocessors=preprocessors,
             finalizer=finalizer,
+            cycle=config.cycle,
         )
         self._info: dict[str, Any] = config.model_dump(mode="json")
         self.epoch = 0

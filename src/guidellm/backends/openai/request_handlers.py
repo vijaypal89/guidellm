@@ -706,6 +706,30 @@ class ChatCompletionsRequestHandler(TextCompletionsRequestHandler):
             return {"type": tool.get("type", "function"), "function": fn}
         return tool
 
+    @staticmethod
+    def _collapse_text_content(
+        content: list[dict[str, Any]], **kwargs
+    ) -> list[dict[str, Any]] | str:
+        """
+        Reduce a text-only content list to a plain string when asked to.
+
+        The multimodal content-part list is the richer encoding, but servers that
+        match on an exact request body (recorded cassettes, strict proxies) only
+        accept the plain string form. Content that carries any non-text part is
+        left untouched because it cannot be expressed as a string.
+
+        :param content: Content parts built for a single chat message
+        :param kwargs: Formatting options; ``text_content_as_string`` enables the
+            plain string encoding
+        :return: The original list, or the concatenated text of every part
+        """
+        if not kwargs.get("text_content_as_string"):
+            return content
+        if not all(part.get("type") == "text" for part in content):
+            return content
+
+        return "".join(part.get("text") or "" for part in content)
+
     def _format_prompts(
         self, column_data: list[dict[str, Any]], column_type: str
     ) -> list[dict[str, Any]]:
@@ -921,7 +945,12 @@ class ChatCompletionsRequestHandler(TextCompletionsRequestHandler):
             ]
             user_content = list(roundrobin(*prompts))
             if user_content:
-                messages.append({"role": "user", "content": user_content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": self._collapse_text_content(user_content, **kwargs),
+                    }
+                )
 
             # Assistant response for history replay.
             wrapped = _wrap_reasoning(
@@ -1030,7 +1059,10 @@ class ChatCompletionsRequestHandler(TextCompletionsRequestHandler):
             user_content = list(roundrobin(*prompts))
             if user_content:
                 arguments.body["messages"].append(
-                    {"role": "user", "content": user_content}
+                    {
+                        "role": "user",
+                        "content": self._collapse_text_content(user_content, **kwargs),
+                    }
                 )
 
         # Inject tool definitions and apply tool-call-specific overrides.

@@ -206,6 +206,14 @@ class RequestInfo(StandardBaseModel):
     error: str | None = Field(
         default=None, description="Error message if the request status is 'errored'"
     )
+    error_status: int | None = Field(
+        default=None,
+        description=(
+            "HTTP status code when the failure came from a server response, so "
+            "reports can group failures by code. None for failures with no "
+            "response, such as connection errors and timeouts."
+        ),
+    )
     traceback: str | None = Field(
         default=None,
         description="Full traceback of the error if the request status is 'errored'",

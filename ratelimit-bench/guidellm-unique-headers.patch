@@ -1,0 +1,809 @@
+diff --git a/src/guidellm/backends/openai/common.py b/src/guidellm/backends/openai/common.py
+index c24351ae..0e5a49cf 100644
+--- a/src/guidellm/backends/openai/common.py
++++ b/src/guidellm/backends/openai/common.py
+@@ -2,22 +2,245 @@
+ 
+ from __future__ import annotations
+ 
++import uuid
+ from typing import Any
+ 
++import httpx
+ from pydantic import SecretStr
+ 
+ from guidellm.utils.imports import json
+ 
+ __all__ = [
++    "ERROR_BODY_LIMIT",
+     "FALLBACK_TIMEOUT",
++    "UNIQUE_HEADER_PLACEHOLDERS",
++    "OpenAIResponseError",
++    "UniqueHeaderGenerator",
+     "build_headers",
+     "format_ws_error",
++    "raise_for_status",
+     "resolve_validate_kwargs",
++    "validate_unique_header_templates",
+ ]
+ 
+ # NOTE: This value is taken from httpx's default
+ FALLBACK_TIMEOUT = 5.0
+ 
++UNIQUE_HEADER_PLACEHOLDERS = ("index", "seq", "worker", "uuid", "value")
++
++# Enough of the server's body to identify a failure without bloating the report
++ERROR_BODY_LIMIT = 400
++
++# Rate limit rejections often have an empty body and explain themselves in headers
++ERROR_DIAGNOSTIC_HEADERS = ("retry-after",)
++ERROR_DIAGNOSTIC_HEADER_PREFIXES = ("x-ratelimit",)
++
++
++class OpenAIResponseError(Exception):
++    """
++    An error response from an OpenAI-compatible server.
++
++    Carries the HTTP status code as a field so benchmark reports can group
++    failures by code (429 rate limited vs 500 server error) instead of parsing
++    it back out of a message, and includes the response body, which is where
++    these servers explain the failure.
++    """
++
++    def __init__(
++        self,
++        status_code: int,
++        body: str = "",
++        url: str = "",
++        diagnostics: dict[str, str] | None = None,
++    ):
++        """
++        :param status_code: HTTP status code returned by the server
++        :param body: Response body, truncated to :data:`ERROR_BODY_LIMIT`
++        :param url: Request URL that produced the error
++        :param diagnostics: Response headers that explain the failure
++        """
++        self.status_code = status_code
++        self.body = body
++        self.url = url
++        self.diagnostics = diagnostics or {}
++
++        # The server's explanation leads and the URL trails, so that a report
++        # truncating this message keeps the part that identifies the failure.
++        reason = httpx.codes.get_reason_phrase(status_code)
++        detail = f"HTTP {status_code} {reason}"
++        if body:
++            detail += f": {body}"
++        if self.diagnostics:
++            headers = " ".join(f"{k}={v}" for k, v in self.diagnostics.items())
++            detail += f" [{headers}]"
++        if url:
++            detail += f" for {url}"
++        super().__init__(detail)
++
++
++def _diagnostic_headers(response: httpx.Response) -> dict[str, str]:
++    """
++    :param response: Response to inspect
++    :return: Headers that explain the failure, such as rate limit budgets
++    """
++    return {
++        name.lower(): value
++        for name, value in response.headers.items()
++        if name.lower() in ERROR_DIAGNOSTIC_HEADERS
++        or name.lower().startswith(ERROR_DIAGNOSTIC_HEADER_PREFIXES)
++    }
++
++
++async def raise_for_status(response: httpx.Response) -> None:
++    """
++    Raise :class:`OpenAIResponseError` when a response carries an error status.
++
++    Replaces ``httpx.Response.raise_for_status`` so the status code stays
++    machine-readable and the server's explanation is captured. Streaming
++    responses are read first, since the body has not been consumed at the point
++    of failure.
++
++    :param response: Response to check
++    :raises OpenAIResponseError: If the response status is 4xx or 5xx
++    """
++    if not response.is_error:
++        return
++
++    try:
++        body = response.text
++    except httpx.ResponseNotRead:
++        body = (await response.aread()).decode("utf-8", errors="replace")
++
++    raise OpenAIResponseError(
++        status_code=response.status_code,
++        body=" ".join(body.split())[:ERROR_BODY_LIMIT],
++        url=str(response.request.url),
++        diagnostics=_diagnostic_headers(response),
++    )
++
++
++class UniqueHeaderGenerator:
++    """
++    Render per-request header values that stay unique across worker processes.
++
++    Each backend instance lives in its own worker process, and the processes share
++    no state, so a plain counter would hand out the same values in every process.
++    Indices are instead strided by the worker count: worker ``w`` on its ``n``-th
++    request yields ``n * workers + w``, which no other worker can produce. This
++    makes every value in a run distinct no matter how the scheduler happens to
++    distribute requests across processes.
++
++    ``count`` additionally confines indices to ``[0, count)`` for drawing from a
++    fixed pool of values. Because guidellm feeds workers from a shared queue,
++    per-worker request counts are uneven, so a bounded run only stays collision
++    free while every worker sends fewer than ``count / workers`` requests. Run
++    with a single worker process (``GUIDELLM__MAX_WORKER_PROCESSES=1``) when a
++    bounded pool must be exhausted exactly once.
++
++    Example:
++    ::
++        generator = UniqueHeaderGenerator(
++            templates={"X-RATELIMIT": "tenant-{index}"},
++            workers=10,
++        )
++        headers = generator.next_headers(worker=3)
++        # {"X-RATELIMIT": "tenant-3"}
++    """
++
++    def __init__(
++        self,
++        templates: dict[str, str],
++        count: int | None = None,
++        values: list[str] | None = None,
++        workers: int = 1,
++    ):
++        """
++        :param templates: Header name to value template, using the placeholders
++            listed in :data:`UNIQUE_HEADER_PLACEHOLDERS`
++        :param count: Size of the value space; indices wrap within it. Defaults to
++            the length of ``values`` when those are given, otherwise unbounded
++        :param values: Literal values selected by index for the ``{value}``
++            placeholder
++        :param workers: Number of worker processes sharing the value space
++        """
++        self.templates = templates
++        self.values = values
++        self.count = count if count is not None else (len(values) if values else None)
++        self.workers = max(1, workers)
++        self._sequences: dict[int, int] = {}
++
++    def next_headers(self, worker: int = 0) -> dict[str, str]:
++        """
++        Render the next value for every configured header.
++
++        :param worker: Rank of the worker process issuing the request
++        :return: Header names mapped to freshly rendered values
++        """
++        worker = max(worker, 0) % self.workers
++        sequence = self._sequences.get(worker, 0)
++        self._sequences[worker] = sequence + 1
++        index = self._next_index(worker, sequence)
++
++        fields: dict[str, Any] = {
++            "index": index,
++            "seq": sequence,
++            "worker": worker,
++            "uuid": uuid.uuid4(),
++        }
++        if self.values:
++            fields["value"] = self.values[index % len(self.values)]
++
++        return {
++            name: template.format(**fields) for name, template in self.templates.items()
++        }
++
++    def _next_index(self, worker: int, sequence: int) -> int:
++        """
++        :return: Index for the given worker rank and per-worker sequence number
++        """
++        # Stride by worker count so no two workers can produce the same index
++        index = sequence * self.workers + worker
++
++        return index if self.count is None else index % self.count
++
++
++def validate_unique_header_templates(
++    templates: dict[str, str] | None,
++    has_values: bool,
++) -> None:
++    """
++    Check that header templates only reference supported placeholders.
++
++    :param templates: Header name to value template mapping
++    :param has_values: Whether literal values are configured, which enables the
++        ``{value}`` placeholder
++    :raises ValueError: If a template references an unknown placeholder or uses
++        malformed format syntax
++    """
++    if not templates:
++        return
++
++    probe: dict[str, Any] = {
++        "index": 0,
++        "seq": 0,
++        "worker": 0,
++        "uuid": uuid.uuid4(),
++    }
++    if has_values:
++        probe["value"] = ""
++
++    for name, template in templates.items():
++        try:
++            template.format(**probe)
++        except (KeyError, IndexError, ValueError) as err:
++            raise ValueError(
++                f"Invalid template for header '{name}': {template!r}. Supported "
++                f"placeholders are {', '.join(UNIQUE_HEADER_PLACEHOLDERS)} "
++                "('{value}' requires values to be configured); escape literal "
++                "braces as '{{' and '}}'. Error: "
++                f"{err}"
++            ) from err
++
+ 
+ def build_headers(
+     api_key: SecretStr | str | None,
+diff --git a/src/guidellm/backends/openai/http.py b/src/guidellm/backends/openai/http.py
+index f6ec2bea..8ce4ccf2 100644
+--- a/src/guidellm/backends/openai/http.py
++++ b/src/guidellm/backends/openai/http.py
+@@ -19,16 +19,23 @@ import httpx
+ from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
+ 
+ from guidellm.backends.backend import Backend, BackendArgs
++from guidellm.backends.openai.common import (
++    UniqueHeaderGenerator,
++    raise_for_status,
++    validate_unique_header_templates,
++)
+ from guidellm.backends.openai.request_handlers import (
+     OpenAIRequestHandler,
+     OpenAIRequestHandlerFactory,
+ )
++from guidellm.logger import logger
+ from guidellm.schemas import (
+     GenerationRequest,
+     GenerationRequestArguments,
+     GenerationResponse,
+     RequestInfo,
+ )
++from guidellm.settings import settings
+ from guidellm.utils.dict import deep_filter
+ 
+ __all__ = [
+@@ -173,6 +180,72 @@ class OpenAIHTTPBackendArgs(BackendArgs):
+             "format template and must contain the '{reasoning}' placeholder text."
+         ),
+     )
++    text_content_as_string: bool = Field(
++        default=False,
++        description=(
++            "Send text-only chat message content as a plain JSON string "
++            "(\"content\": \"...\") instead of a list of content parts "
++            "([{\"type\": \"text\", ...}]). Required by servers that match on an "
++            "exact request body, such as recorded-cassette mocks. Messages that "
++            "carry images, video, or audio keep the content-part list."
++        ),
++    )
++    unique_headers: dict[str, str] | None = Field(
++        default=None,
++        description=(
++            "Headers whose value is re-rendered for every generation request, "
++            "mapping header name to a value template. Available placeholders: "
++            "'{index}' (unique index across all worker processes), '{seq}' "
++            "(per-worker sequence number), '{worker}' (worker process rank), "
++            "'{uuid}' (random UUID4), and '{value}' (entry from "
++            "unique_headers_values). Literal braces must be escaped as '{{' "
++            "and '}}'. These override any statically configured header of the "
++            "same name."
++        ),
++        examples=[{"X-RATELIMIT": "ratelimit-{index}"}],
++    )
++    unique_headers_count: int | None = Field(
++        default=None,
++        gt=0,
++        description=(
++            "Confine '{index}' to [0, count) so values are drawn from a fixed "
++            "pool. Defaults to the length of unique_headers_values when those "
++            "are given, otherwise indices are unbounded and never repeat. Since "
++            "worker processes take requests from a shared queue, their request "
++            "counts are uneven and a bounded pool can repeat a value once a "
++            "worker sends more than count/workers requests; use a single worker "
++            "process (GUIDELLM__MAX_WORKER_PROCESSES=1) to exhaust a pool "
++            "exactly once."
++        ),
++        examples=[5000],
++    )
++    unique_headers_values: list[str] | None = Field(
++        default=None,
++        description=(
++            "Literal values selected by index for the '{value}' placeholder in "
++            "unique_headers, for cases where the values cannot be generated "
++            "(existing API keys, tenant ids, and similar)."
++        ),
++    )
++    unique_headers_workers: int | None = Field(
++        default=None,
++        gt=0,
++        description=(
++            "Stride used to keep indices from colliding between worker "
++            "processes. Must be at least the number of worker processes the "
++            "scheduler starts; defaults to the max_worker_processes setting, "
++            "which is that count for any benchmark whose concurrency is at "
++            "least as high."
++        ),
++    )
++
++    @model_validator(mode="after")
++    def validate_unique_headers(self):
++        """Reject header templates that reference unsupported placeholders."""
++        validate_unique_header_templates(
++            self.unique_headers, has_values=bool(self.unique_headers_values)
++        )
++        return self
+ 
+     @field_validator("multiturn_reasoning", mode="after")
+     @classmethod
+@@ -248,6 +321,8 @@ class OpenAIHTTPBackend(Backend):
+         # Runtime state
+         self._in_process = False
+         self._async_client: httpx.AsyncClient | None = None
++        # Created per worker process so counters start fresh and are never pickled
++        self._unique_headers: UniqueHeaderGenerator | None = None
+ 
+     async def process_startup(self):
+         """
+@@ -275,6 +350,15 @@ class OpenAIHTTPBackend(Backend):
+                 keepalive_expiry=5.0,  # default
+             ),
+         )
++        if self._args.unique_headers:
++            self._unique_headers = UniqueHeaderGenerator(
++                templates=self._args.unique_headers,
++                count=self._args.unique_headers_count,
++                values=self._args.unique_headers_values,
++                workers=(
++                    self._args.unique_headers_workers or settings.max_worker_processes
++                ),
++            )
+         self._in_process = True
+ 
+     async def process_shutdown(self):
+@@ -289,6 +373,7 @@ class OpenAIHTTPBackend(Backend):
+ 
+         await self._async_client.aclose()  # type: ignore [union-attr]
+         self._async_client = None
++        self._unique_headers = None
+         self._in_process = False
+ 
+     async def validate(self):
+@@ -377,7 +462,7 @@ class OpenAIHTTPBackend(Backend):
+             request_handler,
+             arguments,
+             request_kwargs,
+-        ) = await self._prepare_resolve_request(request, history)
++        ) = await self._prepare_resolve_request(request, history, request_info)
+ 
+         if not arguments.stream:
+             async for item in self._resolve_non_streaming(
+@@ -396,6 +481,7 @@ class OpenAIHTTPBackend(Backend):
+         request: GenerationRequest,
+         history: list[tuple[GenerationRequest, GenerationResponse | None]]
+         | None = None,
++        request_info: RequestInfo | None = None,
+     ) -> tuple[
+         OpenAIRequestHandler,
+         GenerationRequestArguments,
+@@ -406,6 +492,8 @@ class OpenAIHTTPBackend(Backend):
+ 
+         :param request: Generation request with content and parameters
+         :param history: Optional conversation history for multi-turn requests
++        :param request_info: Request tracking info, used to scope unique headers
++            to the worker process handling the request
+         :return: Tuple of (request_handler, formatted_arguments, http_kwargs)
+         :raises ValueError: If request format is unsupported
+         """
+@@ -428,6 +516,7 @@ class OpenAIHTTPBackend(Backend):
+             max_tokens=self._args.max_tokens,
+             server_history=self._args.server_history,
+             multiturn_reasoning=self._args.multiturn_reasoning,
++            text_content_as_string=self._args.text_content_as_string,
+         )
+ 
+         request_url = f"{self._args.target}/{request_path}"
+@@ -448,7 +537,7 @@ class OpenAIHTTPBackend(Backend):
+             "url": request_url,
+             "method": arguments.method or "POST",
+             "params": arguments.params,
+-            "headers": self._build_headers(arguments.headers),
++            "headers": self._build_headers(arguments.headers, request_info),
+             "json": request_json,
+             "data": request_data,
+             "files": request_files,
+@@ -480,7 +569,7 @@ class OpenAIHTTPBackend(Backend):
+         request_info.timings.request_start = time.time()
+         response = await self._async_client.request(**request_kwargs)
+         request_info.timings.request_end = time.time()
+-        response.raise_for_status()
++        await raise_for_status(response)
+         data = response.json()
+         gen_response = request_handler.compile_non_streaming(request, arguments, data)
+         yield gen_response, request_info
+@@ -511,11 +600,11 @@ class OpenAIHTTPBackend(Backend):
+             request_info.timings.request_start = time.time()
+ 
+             async with self._async_client.stream(**request_kwargs) as stream:
+-                stream.raise_for_status()
++                await raise_for_status(stream)
+                 end_reached = False
+ 
+                 async for chunk in self._aiter_lines(stream):
+-                    stream.raise_for_status()
++                    await raise_for_status(stream)
+                     iter_time = time.time()
+ 
+                     if request_info.timings.first_request_iteration is None:
+@@ -573,15 +662,20 @@ class OpenAIHTTPBackend(Backend):
+             yield line
+ 
+     def _build_headers(
+-        self, existing_headers: dict[str, str] | None = None
++        self,
++        existing_headers: dict[str, str] | None = None,
++        request_info: RequestInfo | None = None,
+     ) -> dict[str, str] | None:
+         """
+         Build headers dictionary with bearer token authentication.
+ 
+         Merges the Authorization bearer token header (if api_key is set) with any
+         existing headers. User-provided headers take precedence over the bearer token.
++        Any configured unique headers are rendered last so their per-request values
++        win, and are only applied when resolving a request (not for health checks).
+ 
+         :param existing_headers: Optional existing headers to merge with
++        :param request_info: Request tracking info identifying the worker process
+         :return: Dictionary of headers with bearer token included if api_key is set
+         """
+         headers: dict[str, str] = {}
+@@ -595,6 +689,14 @@ class OpenAIHTTPBackend(Backend):
+         if existing_headers:
+             headers = {**headers, **existing_headers}
+ 
++        if self._unique_headers is not None and request_info is not None:
++            unique = self._unique_headers.next_headers(
++                worker=request_info.scheduler_node_id
++            )
++            headers.update(unique)
++            # Logged so a run can be audited for the values the server was sent
++            logger.debug(f"unique_headers {request_info.request_id} {unique}")
++
+         return headers or None
+ 
+     def _check_tool_call_expectations(
+diff --git a/src/guidellm/backends/openai/request_handlers.py b/src/guidellm/backends/openai/request_handlers.py
+index 1a045168..8b351df5 100644
+--- a/src/guidellm/backends/openai/request_handlers.py
++++ b/src/guidellm/backends/openai/request_handlers.py
+@@ -706,6 +706,30 @@ class ChatCompletionsRequestHandler(TextCompletionsRequestHandler):
+             return {"type": tool.get("type", "function"), "function": fn}
+         return tool
+ 
++    @staticmethod
++    def _collapse_text_content(
++        content: list[dict[str, Any]], **kwargs
++    ) -> list[dict[str, Any]] | str:
++        """
++        Reduce a text-only content list to a plain string when asked to.
++
++        The multimodal content-part list is the richer encoding, but servers that
++        match on an exact request body (recorded cassettes, strict proxies) only
++        accept the plain string form. Content that carries any non-text part is
++        left untouched because it cannot be expressed as a string.
++
++        :param content: Content parts built for a single chat message
++        :param kwargs: Formatting options; ``text_content_as_string`` enables the
++            plain string encoding
++        :return: The original list, or the concatenated text of every part
++        """
++        if not kwargs.get("text_content_as_string"):
++            return content
++        if not all(part.get("type") == "text" for part in content):
++            return content
++
++        return "".join(part.get("text") or "" for part in content)
++
+     def _format_prompts(
+         self, column_data: list[dict[str, Any]], column_type: str
+     ) -> list[dict[str, Any]]:
+@@ -921,7 +945,12 @@ class ChatCompletionsRequestHandler(TextCompletionsRequestHandler):
+             ]
+             user_content = list(roundrobin(*prompts))
+             if user_content:
+-                messages.append({"role": "user", "content": user_content})
++                messages.append(
++                    {
++                        "role": "user",
++                        "content": self._collapse_text_content(user_content, **kwargs),
++                    }
++                )
+ 
+             # Assistant response for history replay.
+             wrapped = _wrap_reasoning(
+@@ -1030,7 +1059,10 @@ class ChatCompletionsRequestHandler(TextCompletionsRequestHandler):
+             user_content = list(roundrobin(*prompts))
+             if user_content:
+                 arguments.body["messages"].append(
+-                    {"role": "user", "content": user_content}
++                    {
++                        "role": "user",
++                        "content": self._collapse_text_content(user_content, **kwargs),
++                    }
+                 )
+ 
+         # Inject tool definitions and apply tool-call-specific overrides.
+diff --git a/src/guidellm/benchmark/outputs/console.py b/src/guidellm/benchmark/outputs/console.py
+index 1e0ade6b..f3597eb3 100644
+--- a/src/guidellm/benchmark/outputs/console.py
++++ b/src/guidellm/benchmark/outputs/console.py
+@@ -41,6 +41,41 @@ class ConsoleBenchmarkOutputArgs(BenchmarkOutputArgs):
+ 
+ StatTypesAlias = Literal["mean", "median", "p95"]
+ 
++# Keeps the error summary's message column from wrapping the table
++_ERROR_MESSAGE_WIDTH = 150
++
++
++def _abbreviate_error(message: str, width: int = _ERROR_MESSAGE_WIDTH) -> str:
++    """
++    Shorten an error chain while keeping the cause that identifies the fault.
++
++    Chains are ordered outermost-first, so truncating the tail throws away the
++    part that names the fault: ``ConnectError('All connection attempts failed')``
++    is the same string whether the client ran out of descriptors or the gateway
++    refused, and only the wrapped ``OSError(24, 'Too many open files')`` tells
++    them apart. Keep both ends and drop the middle instead.
++
++    :param message: Error reprs joined by " <- ", outermost first
++    :param width: Character budget for the rendered column
++    :return: The message, or its outermost and innermost links with a gap marker
++    """
++    if len(message) <= width:
++        return message
++
++    links = message.split(" <- ")
++    if len(links) < 2:
++        return message[:width]
++
++    elided = f"{links[0]} <- ... <- {links[-1]}"
++    if len(elided) <= width:
++        return elided
++
++    tail = f" <- ... <- {links[-1]}"
++    if len(tail) >= width:
++        return links[-1][:width]
++
++    return f"{links[0][: width - len(tail)]}{tail}"
++
+ 
+ @dataclass
+ class ConsoleTableColumn:
+@@ -242,9 +277,66 @@ class GenerativeBenchmarkerConsole(GenerativeBenchmarkerOutput):
+         self.print_request_counts_table(report)
+         self.print_request_latency_table(report)
+         self.print_server_throughput_table(report)
++        self.print_error_summary_table(report)
+ 
+         return "printed to console"
+ 
++    def print_error_summary_table(self, report: GenerativeBenchmarksReport):
++        """
++        Print failed requests grouped by HTTP status code, with a sample message.
++
++        Answers why a run failed -- rate limited (429) versus server error (500)
++        versus no response at all -- without digging through logs. Skipped
++        entirely when every request succeeded.
++
++        :param report: The benchmark report containing errored request details
++        """
++        if not any(benchmark.requests.errored for benchmark in report.benchmarks):
++            return
++
++        columns = ConsoleTableColumnsCollection()
++
++        for benchmark in report.benchmarks:
++            errored = benchmark.requests.errored or []
++            groups: dict[str, list[str]] = defaultdict(list)
++            for stats in errored:
++                status = stats.info.error_status
++                groups[str(status) if status is not None else "no response"].append(
++                    stats.info.error or ""
++                )
++
++            total = sum(
++                len(getattr(benchmark.requests, status) or [])
++                for status in ("successful", "incomplete", "errored")
++            )
++
++            for status, messages in sorted(groups.items()):
++                columns.add_value(
++                    benchmark.config.strategy.type_,
++                    group="Benchmark",
++                    name="Strategy",
++                    type_="text",
++                )
++                columns.add_value(status, group="Error", name="Status", type_="text")
++                columns.add_value(len(messages), group="Error", name="Count")
++                columns.add_value(
++                    100.0 * len(messages) / total if total else None,
++                    group="Error",
++                    name="Pct Reqs",
++                )
++                columns.add_value(
++                    _abbreviate_error(messages[0]),
++                    group="Error",
++                    name="Example Message",
++                    type_="text",
++                )
++
++        headers, values = columns.get_table_data()
++        self.console.print("\n")
++        self.console.print_table(
++            headers, values, title="Request Error Summary (Errored Requests)"
++        )
++
+     def print_run_summary_table(self, report: GenerativeBenchmarksReport):
+         """
+         Print the run summary table with timing and token information.
+diff --git a/src/guidellm/data/loaders/torch.py b/src/guidellm/data/loaders/torch.py
+index 302918ba..5bbce3ff 100644
+--- a/src/guidellm/data/loaders/torch.py
++++ b/src/guidellm/data/loaders/torch.py
+@@ -48,6 +48,14 @@ class TorchDataLoaderArgs(DataLoaderArgs):
+             "will be performed in the main process."
+         ),
+     )
++    cycle: bool = Field(
++        default=False,
++        description=(
++            "Restart the datasets when they run out instead of ending the run. "
++            "Required for duration-based benchmarks, which would otherwise stop "
++            "early once the data is exhausted rather than at the time limit."
++        ),
++    )
+ 
+ 
+ DataT = TypeVar("DataT")
+@@ -60,8 +68,10 @@ class DatasetsIterator(TorchIterableDataset[DataT]):
+         data_samples: int,
+         preprocessors: list[DatasetPreprocessor | DataDependentPreprocessor],
+         finalizer: DatasetFinalizer[DataT],
++        cycle: bool = False,
+     ):
+         self.datasets = datasets
++        self.cycle = cycle
+         self.preprocessors = preprocessors
+         for preprocessor in self.preprocessors:
+             if isinstance(preprocessor, DataDependentPreprocessor):
+@@ -110,11 +120,21 @@ class DatasetsIterator(TorchIterableDataset[DataT]):
+                         dataset.set_epoch(epoch)
+                 dataset_iters.append(iter(dataset))
+ 
++            def next_row(index: int) -> dict[str, Any]:
++                try:
++                    return {"dataset": next(dataset_iters[index])}
++                except StopIteration:
++                    if not self.cycle:
++                        raise
++                    # An empty dataset raises again here, ending iteration
++                    # instead of looping forever.
++                    dataset_iters[index] = iter(self.datasets[index])
++                    return {"dataset": next(dataset_iters[index])}
++
+             while max_items is None or gen_count < max_items:
+                 try:
+                     row: list[dict[str, Any]] = [
+-                        {"dataset": next(dataset_iter)}
+-                        for dataset_iter in dataset_iters
++                        next_row(index) for index in range(len(dataset_iters))
+                     ]
+                     gen_count += 1
+ 
+@@ -177,6 +197,7 @@ class TorchDataLoader(PyTorchDataLoader[DataT], InfoMixin, DataLoader[DataT]):
+             data_samples=config.samples,
+             preprocessors=preprocessors,
+             finalizer=finalizer,
++            cycle=config.cycle,
+         )
+         self._info: dict[str, Any] = config.model_dump(mode="json")
+         self.epoch = 0
+diff --git a/src/guidellm/scheduler/worker.py b/src/guidellm/scheduler/worker.py
+index 2df81b11..43628dba 100644
+--- a/src/guidellm/scheduler/worker.py
++++ b/src/guidellm/scheduler/worker.py
+@@ -438,7 +438,8 @@ class WorkerProcess(Generic[RequestT, ResponseT]):
+         except Exception as exc:  # noqa: BLE001
+             premature_exit = True
+             if request is not None and request_info is not None:
+-                request_info.error = repr(exc)
++                request_info.error = self._error_repr(exc)
++                request_info.error_status = self._error_status_code(exc)
+                 request_info.traceback = traceback.format_exc()
+                 request_info.timings.resolve_end = time.time()
+                 self._send_update("errored", response, request, request_info)
+@@ -458,6 +459,52 @@ class WorkerProcess(Generic[RequestT, ResponseT]):
+ 
+         return history, conversation, request_info
+ 
++    @staticmethod
++    def _error_repr(exc: BaseException, max_causes: int = 6) -> str:
++        """
++        Describe an exception together with the causes it wraps.
++
++        Transport errors are the reason a load test failed but say nothing on
++        their own: httpx reports ``ConnectError('All connection attempts
++        failed')`` while the errno that identifies the exhausted resource sits
++        in the wrapped OSError. Following the chain keeps that detail on the
++        request instead of only in the traceback.
++
++        :param exc: Exception raised while resolving a request
++        :param max_causes: How many wrapped causes to include
++        :return: Reprs joined oldest-cause-last, e.g. ``A(...) <- B(...)``
++        """
++        parts = [repr(exc)]
++        seen = {id(exc)}
++        current: BaseException = exc
++
++        while len(parts) <= max_causes:
++            nested = current.__cause__ or current.__context__
++            if nested is None or id(nested) in seen:
++                break
++            seen.add(id(nested))
++            parts.append(repr(nested))
++            current = nested
++
++        return " <- ".join(parts)
++
++    @staticmethod
++    def _error_status_code(exc: BaseException) -> int | None:
++        """
++        Pull an HTTP status code out of a backend exception, if it carries one.
++
++        Backends may expose the code directly or wrap a response object, so both
++        shapes are accepted rather than coupling the scheduler to one backend.
++
++        :param exc: Exception raised while resolving a request
++        :return: HTTP status code, or None if the failure had no response
++        """
++        status = getattr(exc, "status_code", None)
++        if status is None and (response := getattr(exc, "response", None)) is not None:
++            status = getattr(response, "status_code", None)
++
++        return status if isinstance(status, int) else None
++
+     async def _dequeue_next_conversation(
+         self, target_start: float
+     ) -> tuple[HistoryT[RequestT, ResponseT], ConversationT[RequestT]]:
+diff --git a/src/guidellm/schemas/info.py b/src/guidellm/schemas/info.py
+index 9e013a1e..7a7983b2 100644
+--- a/src/guidellm/schemas/info.py
++++ b/src/guidellm/schemas/info.py
+@@ -206,6 +206,14 @@ class RequestInfo(StandardBaseModel):
+     error: str | None = Field(
+         default=None, description="Error message if the request status is 'errored'"
+     )
++    error_status: int | None = Field(
++        default=None,
++        description=(
++            "HTTP status code when the failure came from a server response, so "
++            "reports can group failures by code. None for failures with no "
++            "response, such as connection errors and timeouts."
++        ),
++    )
+     traceback: str | None = Field(
+         default=None,
+         description="Full traceback of the error if the request status is 'errored'",

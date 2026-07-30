@@ -438,7 +438,8 @@ class WorkerProcess(Generic[RequestT, ResponseT]):
         except Exception as exc:  # noqa: BLE001
             premature_exit = True
             if request is not None and request_info is not None:
-                request_info.error = repr(exc)
+                request_info.error = self._error_repr(exc)
+                request_info.error_status = self._error_status_code(exc)
                 request_info.traceback = traceback.format_exc()
                 request_info.timings.resolve_end = time.time()
                 self._send_update("errored", response, request, request_info)
@@ -457,6 +458,52 @@ class WorkerProcess(Generic[RequestT, ResponseT]):
                 conversation = []
 
         return history, conversation, request_info
+
+    @staticmethod
+    def _error_repr(exc: BaseException, max_causes: int = 6) -> str:
+        """
+        Describe an exception together with the causes it wraps.
+
+        Transport errors are the reason a load test failed but say nothing on
+        their own: httpx reports ``ConnectError('All connection attempts
+        failed')`` while the errno that identifies the exhausted resource sits
+        in the wrapped OSError. Following the chain keeps that detail on the
+        request instead of only in the traceback.
+
+        :param exc: Exception raised while resolving a request
+        :param max_causes: How many wrapped causes to include
+        :return: Reprs joined oldest-cause-last, e.g. ``A(...) <- B(...)``
+        """
+        parts = [repr(exc)]
+        seen = {id(exc)}
+        current: BaseException = exc
+
+        while len(parts) <= max_causes:
+            nested = current.__cause__ or current.__context__
+            if nested is None or id(nested) in seen:
+                break
+            seen.add(id(nested))
+            parts.append(repr(nested))
+            current = nested
+
+        return " <- ".join(parts)
+
+    @staticmethod
+    def _error_status_code(exc: BaseException) -> int | None:
+        """
+        Pull an HTTP status code out of a backend exception, if it carries one.
+
+        Backends may expose the code directly or wrap a response object, so both
+        shapes are accepted rather than coupling the scheduler to one backend.
+
+        :param exc: Exception raised while resolving a request
+        :return: HTTP status code, or None if the failure had no response
+        """
+        status = getattr(exc, "status_code", None)
+        if status is None and (response := getattr(exc, "response", None)) is not None:
+            status = getattr(response, "status_code", None)
+
+        return status if isinstance(status, int) else None
 
     async def _dequeue_next_conversation(
         self, target_start: float

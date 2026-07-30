@@ -41,6 +41,41 @@ class ConsoleBenchmarkOutputArgs(BenchmarkOutputArgs):
 
 StatTypesAlias = Literal["mean", "median", "p95"]
 
+# Keeps the error summary's message column from wrapping the table
+_ERROR_MESSAGE_WIDTH = 150
+
+
+def _abbreviate_error(message: str, width: int = _ERROR_MESSAGE_WIDTH) -> str:
+    """
+    Shorten an error chain while keeping the cause that identifies the fault.
+
+    Chains are ordered outermost-first, so truncating the tail throws away the
+    part that names the fault: ``ConnectError('All connection attempts failed')``
+    is the same string whether the client ran out of descriptors or the gateway
+    refused, and only the wrapped ``OSError(24, 'Too many open files')`` tells
+    them apart. Keep both ends and drop the middle instead.
+
+    :param message: Error reprs joined by " <- ", outermost first
+    :param width: Character budget for the rendered column
+    :return: The message, or its outermost and innermost links with a gap marker
+    """
+    if len(message) <= width:
+        return message
+
+    links = message.split(" <- ")
+    if len(links) < 2:
+        return message[:width]
+
+    elided = f"{links[0]} <- ... <- {links[-1]}"
+    if len(elided) <= width:
+        return elided
+
+    tail = f" <- ... <- {links[-1]}"
+    if len(tail) >= width:
+        return links[-1][:width]
+
+    return f"{links[0][: width - len(tail)]}{tail}"
+
 
 @dataclass
 class ConsoleTableColumn:
@@ -242,8 +277,65 @@ class GenerativeBenchmarkerConsole(GenerativeBenchmarkerOutput):
         self.print_request_counts_table(report)
         self.print_request_latency_table(report)
         self.print_server_throughput_table(report)
+        self.print_error_summary_table(report)
 
         return "printed to console"
+
+    def print_error_summary_table(self, report: GenerativeBenchmarksReport):
+        """
+        Print failed requests grouped by HTTP status code, with a sample message.
+
+        Answers why a run failed -- rate limited (429) versus server error (500)
+        versus no response at all -- without digging through logs. Skipped
+        entirely when every request succeeded.
+
+        :param report: The benchmark report containing errored request details
+        """
+        if not any(benchmark.requests.errored for benchmark in report.benchmarks):
+            return
+
+        columns = ConsoleTableColumnsCollection()
+
+        for benchmark in report.benchmarks:
+            errored = benchmark.requests.errored or []
+            groups: dict[str, list[str]] = defaultdict(list)
+            for stats in errored:
+                status = stats.info.error_status
+                groups[str(status) if status is not None else "no response"].append(
+                    stats.info.error or ""
+                )
+
+            total = sum(
+                len(getattr(benchmark.requests, status) or [])
+                for status in ("successful", "incomplete", "errored")
+            )
+
+            for status, messages in sorted(groups.items()):
+                columns.add_value(
+                    benchmark.config.strategy.type_,
+                    group="Benchmark",
+                    name="Strategy",
+                    type_="text",
+                )
+                columns.add_value(status, group="Error", name="Status", type_="text")
+                columns.add_value(len(messages), group="Error", name="Count")
+                columns.add_value(
+                    100.0 * len(messages) / total if total else None,
+                    group="Error",
+                    name="Pct Reqs",
+                )
+                columns.add_value(
+                    _abbreviate_error(messages[0]),
+                    group="Error",
+                    name="Example Message",
+                    type_="text",
+                )
+
+        headers, values = columns.get_table_data()
+        self.console.print("\n")
+        self.console.print_table(
+            headers, values, title="Request Error Summary (Errored Requests)"
+        )
 
     def print_run_summary_table(self, report: GenerativeBenchmarksReport):
         """

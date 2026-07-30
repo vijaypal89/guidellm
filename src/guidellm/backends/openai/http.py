@@ -19,16 +19,23 @@ import httpx
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 
 from guidellm.backends.backend import Backend, BackendArgs
+from guidellm.backends.openai.common import (
+    UniqueHeaderGenerator,
+    raise_for_status,
+    validate_unique_header_templates,
+)
 from guidellm.backends.openai.request_handlers import (
     OpenAIRequestHandler,
     OpenAIRequestHandlerFactory,
 )
+from guidellm.logger import logger
 from guidellm.schemas import (
     GenerationRequest,
     GenerationRequestArguments,
     GenerationResponse,
     RequestInfo,
 )
+from guidellm.settings import settings
 from guidellm.utils.dict import deep_filter
 
 __all__ = [
@@ -173,6 +180,72 @@ class OpenAIHTTPBackendArgs(BackendArgs):
             "format template and must contain the '{reasoning}' placeholder text."
         ),
     )
+    text_content_as_string: bool = Field(
+        default=False,
+        description=(
+            "Send text-only chat message content as a plain JSON string "
+            "(\"content\": \"...\") instead of a list of content parts "
+            "([{\"type\": \"text\", ...}]). Required by servers that match on an "
+            "exact request body, such as recorded-cassette mocks. Messages that "
+            "carry images, video, or audio keep the content-part list."
+        ),
+    )
+    unique_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Headers whose value is re-rendered for every generation request, "
+            "mapping header name to a value template. Available placeholders: "
+            "'{index}' (unique index across all worker processes), '{seq}' "
+            "(per-worker sequence number), '{worker}' (worker process rank), "
+            "'{uuid}' (random UUID4), and '{value}' (entry from "
+            "unique_headers_values). Literal braces must be escaped as '{{' "
+            "and '}}'. These override any statically configured header of the "
+            "same name."
+        ),
+        examples=[{"X-RATELIMIT": "ratelimit-{index}"}],
+    )
+    unique_headers_count: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Confine '{index}' to [0, count) so values are drawn from a fixed "
+            "pool. Defaults to the length of unique_headers_values when those "
+            "are given, otherwise indices are unbounded and never repeat. Since "
+            "worker processes take requests from a shared queue, their request "
+            "counts are uneven and a bounded pool can repeat a value once a "
+            "worker sends more than count/workers requests; use a single worker "
+            "process (GUIDELLM__MAX_WORKER_PROCESSES=1) to exhaust a pool "
+            "exactly once."
+        ),
+        examples=[5000],
+    )
+    unique_headers_values: list[str] | None = Field(
+        default=None,
+        description=(
+            "Literal values selected by index for the '{value}' placeholder in "
+            "unique_headers, for cases where the values cannot be generated "
+            "(existing API keys, tenant ids, and similar)."
+        ),
+    )
+    unique_headers_workers: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Stride used to keep indices from colliding between worker "
+            "processes. Must be at least the number of worker processes the "
+            "scheduler starts; defaults to the max_worker_processes setting, "
+            "which is that count for any benchmark whose concurrency is at "
+            "least as high."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_unique_headers(self):
+        """Reject header templates that reference unsupported placeholders."""
+        validate_unique_header_templates(
+            self.unique_headers, has_values=bool(self.unique_headers_values)
+        )
+        return self
 
     @field_validator("multiturn_reasoning", mode="after")
     @classmethod
@@ -248,6 +321,8 @@ class OpenAIHTTPBackend(Backend):
         # Runtime state
         self._in_process = False
         self._async_client: httpx.AsyncClient | None = None
+        # Created per worker process so counters start fresh and are never pickled
+        self._unique_headers: UniqueHeaderGenerator | None = None
 
     async def process_startup(self):
         """
@@ -275,6 +350,15 @@ class OpenAIHTTPBackend(Backend):
                 keepalive_expiry=5.0,  # default
             ),
         )
+        if self._args.unique_headers:
+            self._unique_headers = UniqueHeaderGenerator(
+                templates=self._args.unique_headers,
+                count=self._args.unique_headers_count,
+                values=self._args.unique_headers_values,
+                workers=(
+                    self._args.unique_headers_workers or settings.max_worker_processes
+                ),
+            )
         self._in_process = True
 
     async def process_shutdown(self):
@@ -289,6 +373,7 @@ class OpenAIHTTPBackend(Backend):
 
         await self._async_client.aclose()  # type: ignore [union-attr]
         self._async_client = None
+        self._unique_headers = None
         self._in_process = False
 
     async def validate(self):
@@ -377,7 +462,7 @@ class OpenAIHTTPBackend(Backend):
             request_handler,
             arguments,
             request_kwargs,
-        ) = await self._prepare_resolve_request(request, history)
+        ) = await self._prepare_resolve_request(request, history, request_info)
 
         if not arguments.stream:
             async for item in self._resolve_non_streaming(
@@ -396,6 +481,7 @@ class OpenAIHTTPBackend(Backend):
         request: GenerationRequest,
         history: list[tuple[GenerationRequest, GenerationResponse | None]]
         | None = None,
+        request_info: RequestInfo | None = None,
     ) -> tuple[
         OpenAIRequestHandler,
         GenerationRequestArguments,
@@ -406,6 +492,8 @@ class OpenAIHTTPBackend(Backend):
 
         :param request: Generation request with content and parameters
         :param history: Optional conversation history for multi-turn requests
+        :param request_info: Request tracking info, used to scope unique headers
+            to the worker process handling the request
         :return: Tuple of (request_handler, formatted_arguments, http_kwargs)
         :raises ValueError: If request format is unsupported
         """
@@ -428,6 +516,7 @@ class OpenAIHTTPBackend(Backend):
             max_tokens=self._args.max_tokens,
             server_history=self._args.server_history,
             multiturn_reasoning=self._args.multiturn_reasoning,
+            text_content_as_string=self._args.text_content_as_string,
         )
 
         request_url = f"{self._args.target}/{request_path}"
@@ -448,7 +537,7 @@ class OpenAIHTTPBackend(Backend):
             "url": request_url,
             "method": arguments.method or "POST",
             "params": arguments.params,
-            "headers": self._build_headers(arguments.headers),
+            "headers": self._build_headers(arguments.headers, request_info),
             "json": request_json,
             "data": request_data,
             "files": request_files,
@@ -480,7 +569,7 @@ class OpenAIHTTPBackend(Backend):
         request_info.timings.request_start = time.time()
         response = await self._async_client.request(**request_kwargs)
         request_info.timings.request_end = time.time()
-        response.raise_for_status()
+        await raise_for_status(response)
         data = response.json()
         gen_response = request_handler.compile_non_streaming(request, arguments, data)
         yield gen_response, request_info
@@ -511,11 +600,11 @@ class OpenAIHTTPBackend(Backend):
             request_info.timings.request_start = time.time()
 
             async with self._async_client.stream(**request_kwargs) as stream:
-                stream.raise_for_status()
+                await raise_for_status(stream)
                 end_reached = False
 
                 async for chunk in self._aiter_lines(stream):
-                    stream.raise_for_status()
+                    await raise_for_status(stream)
                     iter_time = time.time()
 
                     if request_info.timings.first_request_iteration is None:
@@ -573,15 +662,20 @@ class OpenAIHTTPBackend(Backend):
             yield line
 
     def _build_headers(
-        self, existing_headers: dict[str, str] | None = None
+        self,
+        existing_headers: dict[str, str] | None = None,
+        request_info: RequestInfo | None = None,
     ) -> dict[str, str] | None:
         """
         Build headers dictionary with bearer token authentication.
 
         Merges the Authorization bearer token header (if api_key is set) with any
         existing headers. User-provided headers take precedence over the bearer token.
+        Any configured unique headers are rendered last so their per-request values
+        win, and are only applied when resolving a request (not for health checks).
 
         :param existing_headers: Optional existing headers to merge with
+        :param request_info: Request tracking info identifying the worker process
         :return: Dictionary of headers with bearer token included if api_key is set
         """
         headers: dict[str, str] = {}
@@ -594,6 +688,14 @@ class OpenAIHTTPBackend(Backend):
         # Merge with existing headers (user headers take precedence)
         if existing_headers:
             headers = {**headers, **existing_headers}
+
+        if self._unique_headers is not None and request_info is not None:
+            unique = self._unique_headers.next_headers(
+                worker=request_info.scheduler_node_id
+            )
+            headers.update(unique)
+            # Logged so a run can be audited for the values the server was sent
+            logger.debug(f"unique_headers {request_info.request_id} {unique}")
 
         return headers or None
 
